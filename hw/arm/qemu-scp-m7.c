@@ -29,6 +29,7 @@
 
 #define TYPE_QEMU_SCP_M7_MACHINE MACHINE_TYPE_NAME("qemu-scp-m7")
 #define TYPE_QEMU_SCP_GTIMER "qemu-scp-gtimer"
+#define TYPE_QEMU_SCP_SP805 "qemu-scp-sp805"
 
 #define QEMU_SCP_M7_SYSCLK_HZ          25000000
 #define QEMU_SCP_M7_REFCLK_HZ          1000000
@@ -41,6 +42,7 @@
 #define QEMU_SCP_M7_GTIMER_CTRL_BASE   0x44000800
 #define QEMU_SCP_M7_GTIMER_BASE        0x44001000
 #define QEMU_SCP_M7_PL011_BASE         0x44002000
+#define QEMU_SCP_M7_SP805_BASE         0x44006000
 #define QEMU_SCP_M7_GTIMER_IRQ         8
 
 #define SCMI_BRIDGE_TYPE               "scmi-mailbox-bridge"
@@ -59,6 +61,7 @@
 #define GTIMER_CNTBASE_REGION_SIZE     0x1000
 #define GTIMER_CNTCTL_REGION_SIZE      0x0100
 #define GTIMER_CNTCONTROL_REGION_SIZE  0x0100
+#define SP805_REGION_SIZE              0x1000
 
 #define CNTBASE_P_CTL_ENABLE           0x00000001
 #define CNTBASE_P_CTL_IMASK            0x00000002
@@ -66,6 +69,10 @@
 
 #define CNTCONTROL_CR_EN               0x00000001
 #define CNTCONTROL_CR_FCREQ            0x00000100
+
+#define SP805_CONTROL_INT_ENABLE       0x00000001
+#define SP805_CONTROL_RESET_ENABLE     0x00000002
+#define SP805_LOCK_UNLOCK              0x1ACCE551
 
 typedef struct QemuScpGTimerState {
     SysBusDevice parent_obj;
@@ -99,6 +106,23 @@ typedef struct QemuScpM7MachineState {
 
 OBJECT_DECLARE_SIMPLE_TYPE(QemuScpGTimerState, QEMU_SCP_GTIMER)
 OBJECT_DECLARE_SIMPLE_TYPE(QemuScpM7MachineState, QEMU_SCP_M7_MACHINE)
+
+typedef struct QemuScpSp805State {
+    SysBusDevice parent_obj;
+
+    MemoryRegion iomem;
+    qemu_irq irq;
+    QEMUTimer *timer;
+
+    uint32_t load;
+    uint32_t value;
+    uint32_t control;
+    uint32_t lock;
+    uint32_t raw_int_status;
+    int64_t expire_time_ns;
+} QemuScpSp805State;
+
+OBJECT_DECLARE_SIMPLE_TYPE(QemuScpSp805State, QEMU_SCP_SP805)
 
 static uint64_t qemu_scp_gtimer_current_counter(QemuScpGTimerState *s)
 {
@@ -403,6 +427,180 @@ static void qemu_scp_gtimer_finalize(Object *obj)
     timer_free(s->compare_timer);
 }
 
+static uint64_t qemu_scp_sp805_current_value(QemuScpSp805State *s)
+{
+    int64_t now_ns;
+    uint64_t elapsed;
+
+    if ((s->control & SP805_CONTROL_INT_ENABLE) == 0 || s->expire_time_ns == 0) {
+        return s->value;
+    }
+
+    now_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    if (now_ns >= s->expire_time_ns) {
+        return 0;
+    }
+
+    elapsed = muldiv64(
+        (uint64_t)(s->expire_time_ns - now_ns), QEMU_SCP_M7_SYSCLK_HZ,
+        NANOSECONDS_PER_SECOND);
+
+    return MIN(elapsed, UINT32_MAX);
+}
+
+static void qemu_scp_sp805_update_irq(QemuScpSp805State *s)
+{
+    qemu_set_irq(
+        s->irq, ((s->control & SP805_CONTROL_INT_ENABLE) != 0) &&
+                    (s->raw_int_status != 0));
+}
+
+static void qemu_scp_sp805_reload(QemuScpSp805State *s)
+{
+    uint64_t delta_ns;
+
+    timer_del(s->timer);
+    s->value = s->load;
+
+    if ((s->control & SP805_CONTROL_INT_ENABLE) == 0 || s->load == 0) {
+        s->expire_time_ns = 0;
+        return;
+    }
+
+    delta_ns = muldiv64(s->load, NANOSECONDS_PER_SECOND, QEMU_SCP_M7_SYSCLK_HZ);
+    s->expire_time_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + delta_ns;
+    timer_mod(s->timer, s->expire_time_ns);
+}
+
+static void qemu_scp_sp805_expire(void *opaque)
+{
+    QemuScpSp805State *s = opaque;
+
+    s->value = 0;
+    s->raw_int_status = 1;
+    qemu_scp_sp805_update_irq(s);
+}
+
+static uint64_t qemu_scp_sp805_read(void *opaque, hwaddr offset, unsigned size)
+{
+    QemuScpSp805State *s = opaque;
+
+    switch (offset) {
+    case 0x000:
+        return s->load;
+    case 0x004:
+        return qemu_scp_sp805_current_value(s);
+    case 0x008:
+        return s->control;
+    case 0x010:
+    case 0x014:
+        return s->raw_int_status;
+    case 0xC00:
+        return s->lock;
+    case 0xFE0:
+        return 0x05;
+    case 0xFE4:
+        return 0x18;
+    case 0xFE8:
+        return 0x14;
+    case 0xFEC:
+        return 0x00;
+    case 0xFF0:
+        return 0x0D;
+    case 0xFF4:
+        return 0xF0;
+    case 0xFF8:
+        return 0x05;
+    case 0xFFC:
+        return 0xB1;
+    default:
+        return 0;
+    }
+}
+
+static void qemu_scp_sp805_write(
+    void *opaque,
+    hwaddr offset,
+    uint64_t value,
+    unsigned size)
+{
+    QemuScpSp805State *s = opaque;
+    bool unlocked;
+
+    unlocked = (s->lock == 0);
+
+    if (offset == 0xC00) {
+        s->lock = ((uint32_t)value == SP805_LOCK_UNLOCK) ? 0 : 1;
+        return;
+    }
+
+    if (!unlocked) {
+        return;
+    }
+
+    switch (offset) {
+    case 0x000:
+        s->load = (uint32_t)value;
+        qemu_scp_sp805_reload(s);
+        break;
+    case 0x008:
+        s->control = (uint32_t)value &
+            (SP805_CONTROL_INT_ENABLE | SP805_CONTROL_RESET_ENABLE);
+        qemu_scp_sp805_update_irq(s);
+        qemu_scp_sp805_reload(s);
+        break;
+    case 0x00C:
+        s->raw_int_status = 0;
+        qemu_scp_sp805_update_irq(s);
+        qemu_scp_sp805_reload(s);
+        break;
+    default:
+        break;
+    }
+}
+
+static const MemoryRegionOps qemu_scp_sp805_ops = {
+    .read = qemu_scp_sp805_read,
+    .write = qemu_scp_sp805_write,
+    .endianness = DEVICE_NATIVE_ENDIAN,
+    .valid.min_access_size = 4,
+    .valid.max_access_size = 4,
+};
+
+static void qemu_scp_sp805_reset(DeviceState *dev)
+{
+    QemuScpSp805State *s = QEMU_SCP_SP805(dev);
+
+    timer_del(s->timer);
+    s->load = 0xffffffff;
+    s->value = s->load;
+    s->control = 0;
+    s->lock = 0;
+    s->raw_int_status = 0;
+    s->expire_time_ns = 0;
+    qemu_set_irq(s->irq, 0);
+}
+
+static void qemu_scp_sp805_init(Object *obj)
+{
+    QemuScpSp805State *s = QEMU_SCP_SP805(obj);
+    SysBusDevice *sbd = SYS_BUS_DEVICE(obj);
+
+    memory_region_init_io(
+        &s->iomem, obj, &qemu_scp_sp805_ops, s, "qemu-scp-sp805",
+        SP805_REGION_SIZE);
+    sysbus_init_mmio(sbd, &s->iomem);
+    sysbus_init_irq(sbd, &s->irq);
+    s->timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, qemu_scp_sp805_expire, s);
+}
+
+static void qemu_scp_sp805_finalize(Object *obj)
+{
+    QemuScpSp805State *s = QEMU_SCP_SP805(obj);
+
+    timer_free(s->timer);
+}
+
 static void qemu_scp_m7_create_uart(DeviceState *armv7m)
 {
     DeviceState *dev = qdev_new(TYPE_PL011);
@@ -424,6 +622,16 @@ static void qemu_scp_m7_create_gtimer(DeviceState *armv7m)
     sysbus_mmio_map(sbd, 1, QEMU_SCP_M7_GTIMER_CNTCTL_BASE);
     sysbus_mmio_map(sbd, 2, QEMU_SCP_M7_GTIMER_CTRL_BASE);
     sysbus_connect_irq(sbd, 0, qdev_get_gpio_in(armv7m, QEMU_SCP_M7_GTIMER_IRQ));
+}
+
+static void qemu_scp_m7_create_sp805(DeviceState *armv7m)
+{
+    DeviceState *dev = qdev_new(TYPE_QEMU_SCP_SP805);
+    SysBusDevice *sbd = SYS_BUS_DEVICE(dev);
+
+    sysbus_realize_and_unref(sbd, &error_fatal);
+    sysbus_mmio_map(sbd, 0, QEMU_SCP_M7_SP805_BASE);
+    sysbus_connect_irq(sbd, 0, qdev_get_gpio_in_named(armv7m, "NMI", 0));
 }
 
 static void qemu_scp_m7_create_scmi_bridge(DeviceState *armv7m)
@@ -492,6 +700,8 @@ static void qemu_scp_m7_init(MachineState *machine)
     create_unimplemented_device(
         "qemu-scp-m7.timer-cfg-gap1", 0x44000900, 0x00000700);
     create_unimplemented_device(
+        "qemu-scp-m7.apb-gap", 0x44005000, 0x00001000);
+    create_unimplemented_device(
         "qemu-scp-m7.uart-cfg-reserved", 0x44003000, 0x00002000);
     create_unimplemented_device(
         "qemu-scp-m7.mhu-secure-rcv", QEMU_SCP_M7_MHU_S_RCV_BASE,
@@ -502,6 +712,7 @@ static void qemu_scp_m7_init(MachineState *machine)
 
     qemu_scp_m7_create_gtimer(armv7m);
     qemu_scp_m7_create_uart(armv7m);
+    qemu_scp_m7_create_sp805(armv7m);
     qemu_scp_m7_create_scmi_bridge(armv7m);
 
     armv7m_load_kernel(
@@ -532,6 +743,13 @@ static void qemu_scp_gtimer_class_init(ObjectClass *oc, const void *data)
     device_class_set_legacy_reset(dc, qemu_scp_gtimer_reset);
 }
 
+static void qemu_scp_sp805_class_init(ObjectClass *oc, const void *data)
+{
+    DeviceClass *dc = DEVICE_CLASS(oc);
+
+    device_class_set_legacy_reset(dc, qemu_scp_sp805_reset);
+}
+
 static const TypeInfo qemu_scp_gtimer_info = {
     .name = TYPE_QEMU_SCP_GTIMER,
     .parent = TYPE_SYS_BUS_DEVICE,
@@ -549,9 +767,19 @@ static const TypeInfo qemu_scp_m7_machine_info = {
     .interfaces = arm_machine_interfaces,
 };
 
+static const TypeInfo qemu_scp_sp805_info = {
+    .name = TYPE_QEMU_SCP_SP805,
+    .parent = TYPE_SYS_BUS_DEVICE,
+    .instance_size = sizeof(QemuScpSp805State),
+    .instance_init = qemu_scp_sp805_init,
+    .instance_finalize = qemu_scp_sp805_finalize,
+    .class_init = qemu_scp_sp805_class_init,
+};
+
 static void qemu_scp_m7_register_types(void)
 {
     type_register_static(&qemu_scp_gtimer_info);
+    type_register_static(&qemu_scp_sp805_info);
     type_register_static(&qemu_scp_m7_machine_info);
 }
 
