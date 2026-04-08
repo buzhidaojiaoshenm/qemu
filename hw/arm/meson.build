@@ -78,6 +78,7 @@ arm_common_ss.add(when: ['CONFIG_ASPEED_SOC', 'TARGET_AARCH64'], if_true: files(
   'aspeed_coprocessor_common.c'))
 arm_common_ss.add(when: 'CONFIG_MPS2', if_true: files('mps2.c'))
 arm_common_ss.add(when: 'CONFIG_MPS2', if_true: files('mps2-tz.c'))
+arm_common_ss.add(when: 'CONFIG_ARM_V7M', if_true: files('qemu-scp-m7.c'))
 arm_common_ss.add(when: 'CONFIG_MSF2', if_true: files('msf2-soc.c'))
 arm_common_ss.add(when: 'CONFIG_MUSCA', if_true: files('musca.c'))
 arm_common_ss.add(when: 'CONFIG_ARMSSE', if_true: files('armsse.c'))
