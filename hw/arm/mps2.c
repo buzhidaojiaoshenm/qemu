@@ -52,6 +52,15 @@
 #include "qobject/qlist.h"
 #include "qom/object.h"
 
+#define SCMI_BRIDGE_TYPE "scmi-mailbox-bridge"
+#define SCMI_BRIDGE_SCP_MMIO_BASE 0x40014000
+#define SCMI_BRIDGE_SCP_SHM_BASE  0x40015000
+#define SCMI_BRIDGE_SCP_SHM_SIZE  0x00001000
+#define SCMI_BRIDGE_SCP_IRQ       11
+#define SCMI_BRIDGE_SHM_PATH      "/tmp/qemu_virt_soc.scmi_bridge.shm"
+#define SCMI_BRIDGE_AP_SOCK_PATH  "/tmp/qemu_virt_soc.ap.sock"
+#define SCMI_BRIDGE_SCP_SOCK_PATH "/tmp/qemu_virt_soc.scp.sock"
+
 typedef enum MPS2FPGAType {
     FPGA_AN385,
     FPGA_AN386,
@@ -131,6 +140,22 @@ static void make_ram_alias(MemoryRegion *mr, const char *name,
     memory_region_init_alias(mr, NULL, name, orig, 0,
                              memory_region_size(orig));
     memory_region_add_subregion(get_system_memory(), base, mr);
+}
+
+static void create_scmi_mailbox_bridge(DeviceState *armv7m)
+{
+    DeviceState *dev = qdev_new(SCMI_BRIDGE_TYPE);
+    SysBusDevice *sbd = SYS_BUS_DEVICE(dev);
+
+    qdev_prop_set_string(dev, "local-socket-path", SCMI_BRIDGE_SCP_SOCK_PATH);
+    qdev_prop_set_string(dev, "peer-socket-path", SCMI_BRIDGE_AP_SOCK_PATH);
+    qdev_prop_set_string(dev, "shm-path", SCMI_BRIDGE_SHM_PATH);
+    qdev_prop_set_uint64(dev, "shm-size", SCMI_BRIDGE_SCP_SHM_SIZE);
+
+    sysbus_realize_and_unref(sbd, &error_fatal);
+    sysbus_mmio_map(sbd, 0, SCMI_BRIDGE_SCP_MMIO_BASE);
+    sysbus_mmio_map(sbd, 1, SCMI_BRIDGE_SCP_SHM_BASE);
+    sysbus_connect_irq(sbd, 0, qdev_get_gpio_in(armv7m, SCMI_BRIDGE_SCP_IRQ));
 }
 
 static void mps2_common_init(MachineState *machine)
@@ -364,6 +389,8 @@ static void mps2_common_init(MachineState *machine)
                                           0x40012000, 0x40013000};
         create_unimplemented_device("cmsdk-ahb-gpio", gpiobase[i], 0x1000);
     }
+
+    create_scmi_mailbox_bridge(armv7m);
 
     /* CMSDK APB subsystem */
     for (i = 0; i < ARRAY_SIZE(mms->timer); i++) {

@@ -151,6 +151,15 @@ static void arm_virt_compat_default_set(MachineClass *mc)
 
 #define PLATFORM_BUS_NUM_IRQS 64
 
+#define SCMI_BRIDGE_TYPE "scmi-mailbox-bridge"
+#define SCMI_BRIDGE_AP_MMIO_BASE 0x090d0000
+#define SCMI_BRIDGE_AP_SHM_BASE  0x090e0000
+#define SCMI_BRIDGE_AP_SHM_SIZE  0x00001000
+#define SCMI_BRIDGE_AP_IRQ       10
+#define SCMI_BRIDGE_SHM_PATH     "/tmp/qemu_virt_soc.scmi_bridge.shm"
+#define SCMI_BRIDGE_AP_SOCK_PATH "/tmp/qemu_virt_soc.ap.sock"
+#define SCMI_BRIDGE_SCP_SOCK_PATH "/tmp/qemu_virt_soc.scp.sock"
+
 /* Legacy RAM limit in GB (< version 4.0) */
 #define LEGACY_RAMLIMIT_GB 255
 #define LEGACY_RAMLIMIT_BYTES (LEGACY_RAMLIMIT_GB * GiB)
@@ -1039,6 +1048,25 @@ static void create_rtc(const VirtMachineState *vms)
     qemu_fdt_setprop_cell(ms->fdt, nodename, "clocks", vms->clock_phandle);
     qemu_fdt_setprop_string(ms->fdt, nodename, "clock-names", "apb_pclk");
     g_free(nodename);
+}
+
+static void create_scmi_mailbox_bridge(const VirtMachineState *vms,
+                                       MemoryRegion *mem)
+{
+    DeviceState *dev = qdev_new(SCMI_BRIDGE_TYPE);
+    SysBusDevice *sbd = SYS_BUS_DEVICE(dev);
+
+    qdev_prop_set_string(dev, "local-socket-path", SCMI_BRIDGE_AP_SOCK_PATH);
+    qdev_prop_set_string(dev, "peer-socket-path", SCMI_BRIDGE_SCP_SOCK_PATH);
+    qdev_prop_set_string(dev, "shm-path", SCMI_BRIDGE_SHM_PATH);
+    qdev_prop_set_uint64(dev, "shm-size", SCMI_BRIDGE_AP_SHM_SIZE);
+
+    sysbus_realize_and_unref(sbd, &error_fatal);
+    memory_region_add_subregion(mem, SCMI_BRIDGE_AP_MMIO_BASE,
+                                sysbus_mmio_get_region(sbd, 0));
+    memory_region_add_subregion(mem, SCMI_BRIDGE_AP_SHM_BASE,
+                                sysbus_mmio_get_region(sbd, 1));
+    sysbus_connect_irq(sbd, 0, qdev_get_gpio_in(vms->gic, SCMI_BRIDGE_AP_IRQ));
 }
 
 static DeviceState *gpio_key_dev;
@@ -2550,6 +2578,8 @@ static void machvirt_init(MachineState *machine)
     if (vms->secure) {
         create_uart(vms, VIRT_UART1, secure_sysmem, serial_hd(1), true);
     }
+
+    create_scmi_mailbox_bridge(vms, sysmem);
 
     if (vms->secure) {
         create_secure_ram(vms, secure_sysmem, secure_tag_sysmem);
