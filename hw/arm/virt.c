@@ -151,7 +151,8 @@ static void arm_virt_compat_default_set(MachineClass *mc)
 
 #define PLATFORM_BUS_NUM_IRQS 64
 
-#define SCMI_BRIDGE_TYPE "scmi-mailbox-bridge"
+#define SCMI_BRIDGE_TYPE         "scmi-mailbox-bridge"
+#define ARM_CMN_CFG_TYPE         "arm-cmn-cfg"
 #define SCMI_BRIDGE_AP_MMIO_BASE 0x090d0000
 #define SCMI_BRIDGE_AP_SHM_BASE  0x090e0000
 #define SCMI_BRIDGE_AP_SHM_SIZE  0x00001000
@@ -159,6 +160,9 @@ static void arm_virt_compat_default_set(MachineClass *mc)
 #define SCMI_BRIDGE_SHM_PATH     "/tmp/qemu_virt_soc.scmi_bridge.shm"
 #define SCMI_BRIDGE_AP_SOCK_PATH "/tmp/qemu_virt_soc.ap.sock"
 #define SCMI_BRIDGE_SCP_SOCK_PATH "/tmp/qemu_virt_soc.scp.sock"
+#define ARM_CMN_CFG_AP_BASE      0x140000000ULL
+#define ARM_CMN_CFG_AP_SIZE      0x40000000ULL
+#define ARM_CMN_CFG_SHM_PATH     "/tmp/qemu_virt_soc.arm_cmn_cfg.shm"
 
 /* Legacy RAM limit in GB (< version 4.0) */
 #define LEGACY_RAMLIMIT_GB 255
@@ -1067,6 +1071,19 @@ static void create_scmi_mailbox_bridge(const VirtMachineState *vms,
     memory_region_add_subregion(mem, SCMI_BRIDGE_AP_SHM_BASE,
                                 sysbus_mmio_get_region(sbd, 1));
     sysbus_connect_irq(sbd, 0, qdev_get_gpio_in(vms->gic, SCMI_BRIDGE_AP_IRQ));
+}
+
+static void create_arm_cmn_cfg(MemoryRegion *mem)
+{
+    DeviceState *dev = qdev_new(ARM_CMN_CFG_TYPE);
+    SysBusDevice *sbd = SYS_BUS_DEVICE(dev);
+
+    qdev_prop_set_string(dev, "shm-path", ARM_CMN_CFG_SHM_PATH);
+    qdev_prop_set_uint64(dev, "cfg-size", ARM_CMN_CFG_AP_SIZE);
+
+    sysbus_realize_and_unref(sbd, &error_fatal);
+    memory_region_add_subregion(mem, ARM_CMN_CFG_AP_BASE,
+                                sysbus_mmio_get_region(sbd, 0));
 }
 
 static DeviceState *gpio_key_dev;
@@ -2580,6 +2597,7 @@ static void machvirt_init(MachineState *machine)
     }
 
     create_scmi_mailbox_bridge(vms, sysmem);
+    create_arm_cmn_cfg(sysmem);
 
     if (vms->secure) {
         create_secure_ram(vms, secure_sysmem, secure_tag_sysmem);

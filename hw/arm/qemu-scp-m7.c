@@ -30,6 +30,7 @@
 #define TYPE_QEMU_SCP_M7_MACHINE MACHINE_TYPE_NAME("qemu-scp-m7")
 #define TYPE_QEMU_SCP_GTIMER "qemu-scp-gtimer"
 #define TYPE_QEMU_SCP_SP805 "qemu-scp-sp805"
+#define TYPE_ARM_CMN_CFG "arm-cmn-cfg"
 
 #define QEMU_SCP_M7_SYSCLK_HZ          25000000
 #define QEMU_SCP_M7_REFCLK_HZ          1000000
@@ -57,6 +58,9 @@
 #define QEMU_SCP_M7_MHU_S_RCV_BASE     0x45020000
 #define QEMU_SCP_M7_MHU_S_SND_BASE     0x45030000
 #define QEMU_SCP_M7_MHU_WINDOW_SIZE    0x00010000
+#define QEMU_SCP_M7_CMN_CFG_BASE       0x60000000
+#define QEMU_SCP_M7_CMN_CFG_SIZE       0x40000000ULL
+#define QEMU_SCP_M7_CMN_CFG_SHM_PATH   "/tmp/qemu_virt_soc.arm_cmn_cfg.shm"
 
 #define GTIMER_CNTBASE_REGION_SIZE     0x1000
 #define GTIMER_CNTCTL_REGION_SIZE      0x0100
@@ -650,6 +654,18 @@ static void qemu_scp_m7_create_scmi_bridge(DeviceState *armv7m)
     sysbus_connect_irq(sbd, 0, qdev_get_gpio_in(armv7m, SCMI_BRIDGE_SCP_IRQ));
 }
 
+static void qemu_scp_m7_create_cmn_cfg(void)
+{
+    DeviceState *dev = qdev_new(TYPE_ARM_CMN_CFG);
+    SysBusDevice *sbd = SYS_BUS_DEVICE(dev);
+
+    qdev_prop_set_string(dev, "shm-path", QEMU_SCP_M7_CMN_CFG_SHM_PATH);
+    qdev_prop_set_uint64(dev, "cfg-size", QEMU_SCP_M7_CMN_CFG_SIZE);
+
+    sysbus_realize_and_unref(sbd, &error_fatal);
+    sysbus_mmio_map(sbd, 0, QEMU_SCP_M7_CMN_CFG_BASE);
+}
+
 static void qemu_scp_m7_init(MachineState *machine)
 {
     QemuScpM7MachineState *sms = QEMU_SCP_M7_MACHINE(machine);
@@ -714,6 +730,7 @@ static void qemu_scp_m7_init(MachineState *machine)
     qemu_scp_m7_create_uart(armv7m);
     qemu_scp_m7_create_sp805(armv7m);
     qemu_scp_m7_create_scmi_bridge(armv7m);
+    qemu_scp_m7_create_cmn_cfg();
 
     armv7m_load_kernel(
         sms->armv7m.cpu, machine->kernel_filename, 0, machine->ram_size);
