@@ -61,6 +61,8 @@
 #define QEMU_SCP_M7_CMN_CFG_BASE       0x60000000
 #define QEMU_SCP_M7_CMN_CFG_SIZE       0x40000000ULL
 #define QEMU_SCP_M7_CMN_CFG_SHM_PATH   "/tmp/qemu_virt_soc.arm_cmn_cfg.shm"
+#define QEMU_SCP_M7_CMN_TRACE_BASE     0xA0000000
+#define QEMU_SCP_M7_CMN_TRACE_SHM_PATH "/tmp/qemu_virt_soc.arm_cmn_trace.shm"
 
 #define GTIMER_CNTBASE_REGION_SIZE     0x1000
 #define GTIMER_CNTCTL_REGION_SIZE      0x0100
@@ -660,10 +662,13 @@ static void qemu_scp_m7_create_cmn_cfg(void)
     SysBusDevice *sbd = SYS_BUS_DEVICE(dev);
 
     qdev_prop_set_string(dev, "shm-path", QEMU_SCP_M7_CMN_CFG_SHM_PATH);
+    qdev_prop_set_string(dev, "trace-shm-path", QEMU_SCP_M7_CMN_TRACE_SHM_PATH);
+    qdev_prop_set_string(dev, "role", "scp");
     qdev_prop_set_uint64(dev, "cfg-size", QEMU_SCP_M7_CMN_CFG_SIZE);
 
     sysbus_realize_and_unref(sbd, &error_fatal);
     sysbus_mmio_map(sbd, 0, QEMU_SCP_M7_CMN_CFG_BASE);
+    sysbus_mmio_map(sbd, 1, QEMU_SCP_M7_CMN_TRACE_BASE);
 }
 
 static void qemu_scp_m7_init(MachineState *machine)

@@ -163,6 +163,8 @@ static void arm_virt_compat_default_set(MachineClass *mc)
 #define ARM_CMN_CFG_AP_BASE      0x140000000ULL
 #define ARM_CMN_CFG_AP_SIZE      0x40000000ULL
 #define ARM_CMN_CFG_SHM_PATH     "/tmp/qemu_virt_soc.arm_cmn_cfg.shm"
+#define ARM_CMN_TRACE_AP_BASE    0x180000000ULL
+#define ARM_CMN_TRACE_SHM_PATH   "/tmp/qemu_virt_soc.arm_cmn_trace.shm"
 
 /* Legacy RAM limit in GB (< version 4.0) */
 #define LEGACY_RAMLIMIT_GB 255
@@ -1079,11 +1081,15 @@ static void create_arm_cmn_cfg(MemoryRegion *mem)
     SysBusDevice *sbd = SYS_BUS_DEVICE(dev);
 
     qdev_prop_set_string(dev, "shm-path", ARM_CMN_CFG_SHM_PATH);
+    qdev_prop_set_string(dev, "trace-shm-path", ARM_CMN_TRACE_SHM_PATH);
+    qdev_prop_set_string(dev, "role", "ap");
     qdev_prop_set_uint64(dev, "cfg-size", ARM_CMN_CFG_AP_SIZE);
 
     sysbus_realize_and_unref(sbd, &error_fatal);
     memory_region_add_subregion(mem, ARM_CMN_CFG_AP_BASE,
                                 sysbus_mmio_get_region(sbd, 0));
+    memory_region_add_subregion(mem, ARM_CMN_TRACE_AP_BASE,
+                                sysbus_mmio_get_region(sbd, 1));
 }
 
 static DeviceState *gpio_key_dev;
