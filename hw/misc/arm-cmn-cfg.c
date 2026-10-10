@@ -1,10 +1,10 @@
 /*
- * Minimal shared Arm CMN configuration-space model.
+ * Shared Arm CMN configuration-space model.
  *
- * The model only exposes a shared, RAM-backed CMN configuration aperture.
- * It seeds enough discovery-visible topology for SCP-firmware's cmn_cyprus
- * module to walk the mesh and program HN-S/RNSAM state. Functional CMN
- * behavior is intentionally out of scope for now.
+ * A repository tool compiles the topology YAML and TRM reset profile into a
+ * compact CMN3 artifact.  This device validates that artifact before touching
+ * shared state, then applies its register/value entries to the CMN aperture.
+ * Functional CMN behavior is intentionally out of scope.
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
@@ -21,72 +21,26 @@
 
 #include <sys/mman.h>
 #include <unistd.h>
+#include <zlib.h>
 
 #define TYPE_ARM_CMN_CFG "arm-cmn-cfg"
 OBJECT_DECLARE_SIMPLE_TYPE(ArmCmnCfgState, ARM_CMN_CFG)
 
 #define ARM_CMN_CFG_DEFAULT_SIZE      0x40000000ULL
-#define ARM_CMN_CFG_SEED_SIZE         0x03000000ULL
 #define ARM_CMN_TRACE_SIZE            0x40000ULL
 
-#define CMN_CFG_NODE_INFO             0x0000
-#define CMN_CFG_PERIPH_ID_01          0x0008
-#define CMN_CFG_PERIPH_ID_23          0x0010
-#define CMN_CFG_PERIPH_ID_45          0x0018
-#define CMN_CFG_PERIPH_ID_67          0x0020
-#define CMN_CFG_COMPONENT_ID_01       0x0028
-#define CMN_CFG_COMPONENT_ID_23       0x0030
-#define CMN_CFG_CHILD_INFO            0x0080
-#define CMN_CFG_CHILD_PTR_BASE        0x0100
-#define CMN_CFG_INFO_GLOBAL           0x0900
-#define CMN_CFG_INFO_GLOBAL_1         0x0908
-#define CMN_CFG_SECURE_ACCESS         0x0980
-#define CMN_CFG_RCR                   0x0988
-#define CMN_CFG_SCR                   0x0990
-#define CMN_CFG_RAS_MODE              0x0a00
-#define CMN_CFG_UNIT_INFO_0           0x0900
-#define CMN_CFG_UNIT_INFO_1           0x0908
+#define CMN3_HEADER_SIZE              64U
+#define CMN3_ENTRY_SIZE               16U
+#define CMN3_FORMAT_VERSION           1U
 
-#define CMN_NODE_CHILD_INFO           0x0080
-
-#define CMN_MXP_PORT_INFO_BASE        0x0008
-#define CMN_MXP_PORT_INFO_STEP        0x0008
-#define CMN_MXP_CHILD_PTR_BASE        0x0100
-
-#define CMN_NODE_TYPE_CFG_ROOT        0x0002
-#define CMN_NODE_TYPE_HN_I            0x0004
-#define CMN_NODE_TYPE_XP              0x0006
-#define CMN_NODE_TYPE_SBSX            0x0007
-#define CMN_NODE_TYPE_RN_I            0x000a
-#define CMN_NODE_TYPE_RN_D            0x000d
-#define CMN_NODE_TYPE_RN_SAM          0x000f
-#define CMN_NODE_TYPE_HN_P            0x0011
-#define CMN_NODE_TYPE_CCRA            0x0103
-#define CMN_NODE_TYPE_CCHA            0x0104
-#define CMN_NODE_TYPE_CCLA            0x0105
-#define CMN_NODE_TYPE_HN_S            0x0200
-#define CMN_NODE_TYPE_HN_S_MPAM_S     0x0201
-#define CMN_NODE_TYPE_HN_S_MPAM_NS    0x0202
-
-#define CMN_DEVTYPE_RN_I              0x01
-#define CMN_DEVTYPE_RN_D              0x02
-#define CMN_DEVTYPE_HN_I              0x09
-#define CMN_DEVTYPE_HN_D              0x0a
-#define CMN_DEVTYPE_HN_P              0x0b
-#define CMN_DEVTYPE_SBSX              0x0d
-#define CMN_DEVTYPE_HN_S              0x1a
-#define CMN_DEVTYPE_CCG               0x1e
-#define CMN_DEVTYPE_RNF_ESAM          0x21
-#define CMN_DEVTYPE_SNF               0x22
-
-#define CMN_CHILD_COUNT_MASK          0xffffULL
-#define CMN_CHILD_PTR_OFF_POS         16
-#define CMN_NODE_INFO_TYPE_MASK       0xffffULL
-#define CMN_NODE_INFO_ID_POS          16
-#define CMN_NODE_INFO_LDID_POS        32
-#define CMN_MXP_NUM_PORTS_POS         48
-#define CMN_CHILD_PTR_EXTERNAL_POS    31
-#define CMN_MXP_PORT_CAL_CONNECTED    0x80U
+#define ARM_CMN_TRACE_MAGIC          0x434d4e5452414345ULL
+#define ARM_CMN_TRACE_ENTRY_COUNT    4096U
+#define ARM_CMN_TRACE_ENTRY_BASE     0x100U
+#define ARM_CMN_TRACE_ENTRY_STRIDE   0x20U
+#define ARM_CMN_TRACE_REG_MAGIC      0x000
+#define ARM_CMN_TRACE_REG_PRODUCER   0x008
+#define ARM_CMN_TRACE_REG_CONSUMER   0x010
+#define ARM_CMN_TRACE_REG_CAPACITY   0x018
 
 typedef struct ArmCmnCfgState {
     SysBusDevice parent_obj;
@@ -95,11 +49,23 @@ typedef struct ArmCmnCfgState {
     MemoryRegion trace;
     char *shm_path;
     char *trace_shm_path;
+    char *topology_file;
     char *role;
     uint64_t cfg_size;
     uint8_t *cfg_ptr;
     uint8_t *trace_ptr;
 } ArmCmnCfgState;
+
+typedef struct Cmn3Entry {
+    uint64_t offset;
+    uint64_t value;
+} Cmn3Entry;
+
+typedef struct Cmn3Topology {
+    uint32_t seed_extent;
+    uint32_t entry_count;
+    Cmn3Entry *entries;
+} Cmn3Topology;
 
 enum ArmCmnCfgRole {
     ARM_CMN_ROLE_AP,
@@ -125,331 +91,6 @@ struct ArmCmnTraceEntry {
     uint64_t value;
 };
 
-#define ARM_CMN_TRACE_MAGIC          0x434d4e5452414345ULL
-#define ARM_CMN_TRACE_ENTRY_COUNT    4096U
-#define ARM_CMN_TRACE_ENTRY_BASE     0x100U
-#define ARM_CMN_TRACE_ENTRY_STRIDE   0x20U
-#define ARM_CMN_TRACE_REG_MAGIC      0x000
-#define ARM_CMN_TRACE_REG_PRODUCER   0x008
-#define ARM_CMN_TRACE_REG_CONSUMER   0x010
-#define ARM_CMN_TRACE_REG_CAPACITY   0x018
-
-struct CmnPortSeed {
-    uint8_t device_type;
-    bool cal_connected;
-};
-
-struct CmnChildSeed {
-    uint32_t offset;
-    uint16_t node_type;
-    uint16_t node_id;
-    uint16_t ldid;
-    bool external;
-};
-
-struct CmnXpSeed {
-    uint32_t offset;
-    uint16_t node_id;
-    uint16_t ldid;
-    uint8_t port_count;
-    struct CmnPortSeed ports[6];
-    const struct CmnChildSeed *children;
-    size_t child_count;
-};
-
-enum CmnInternalKind {
-    CMN_INTERNAL_CFG,
-    CMN_INTERNAL_DT,
-    CMN_INTERNAL_DN,
-    CMN_INTERNAL_APB,
-    CMN_INTERNAL_RNI_RNSAM,
-};
-
-struct CmnInternalSeed {
-    uint32_t offset;
-    enum CmnInternalKind kind;
-    uint16_t node_id;
-    uint16_t ldid;
-    uint16_t owner_type;
-    const uint32_t *children;
-    uint16_t child_count;
-};
-
-static const struct CmnChildSeed cmn_xp00_children[] = {
-    { .offset = 0x0100000, .node_type = CMN_NODE_TYPE_SBSX, .node_id = 0, .ldid = 0, .external = false },
-    { .offset = 0x0180000, .node_type = CMN_NODE_TYPE_HN_I, .node_id = 2, .ldid = 0, .external = false },
-    { .offset = 0x0210000, .node_type = CMN_NODE_TYPE_RN_SAM, .node_id = 4, .ldid = 0, .external = false },
-    { .offset = 0x0110000, .node_type = CMN_NODE_TYPE_RN_I, .node_id = 4, .ldid = 0, .external = false },
-    { .offset = 0x0390000, .node_type = CMN_NODE_TYPE_CCRA, .node_id = 6, .ldid = 0, .external = false },
-    { .offset = 0x0290000, .node_type = CMN_NODE_TYPE_CCLA, .node_id = 6, .ldid = 0, .external = false },
-    { .offset = 0x0090000, .node_type = CMN_NODE_TYPE_RN_SAM, .node_id = 6, .ldid = 1, .external = false },
-    { .offset = 0x0190000, .node_type = CMN_NODE_TYPE_CCHA, .node_id = 6, .ldid = 0, .external = false },
-    { .offset = 0x01d0000, .node_type = CMN_NODE_TYPE_RN_I, .node_id = 7, .ldid = 1, .external = false },
-};
-
-static const struct CmnChildSeed cmn_xp01_children[] = {
-    { .offset = 0x04a0000, .node_type = CMN_NODE_TYPE_RN_SAM, .node_id = 8, .ldid = 2, .external = true },
-    { .offset = 0x0780000, .node_type = CMN_NODE_TYPE_HN_S, .node_id = 10, .ldid = 0, .external = false },
-    { .offset = 0x0580000, .node_type = CMN_NODE_TYPE_HN_S_MPAM_S, .node_id = 10, .ldid = 0, .external = false },
-    { .offset = 0x0680000, .node_type = CMN_NODE_TYPE_HN_S_MPAM_NS, .node_id = 10, .ldid = 0, .external = false },
-    { .offset = 0x07c0000, .node_type = CMN_NODE_TYPE_HN_S, .node_id = 11, .ldid = 1, .external = false },
-    { .offset = 0x05c0000, .node_type = CMN_NODE_TYPE_HN_S_MPAM_S, .node_id = 11, .ldid = 1, .external = false },
-    { .offset = 0x06c0000, .node_type = CMN_NODE_TYPE_HN_S_MPAM_NS, .node_id = 11, .ldid = 1, .external = false },
-    { .offset = 0x0710000, .node_type = CMN_NODE_TYPE_CCRA, .node_id = 12, .ldid = 1, .external = false },
-    { .offset = 0x0610000, .node_type = CMN_NODE_TYPE_CCLA, .node_id = 12, .ldid = 1, .external = false },
-    { .offset = 0x0410000, .node_type = CMN_NODE_TYPE_RN_SAM, .node_id = 12, .ldid = 3, .external = false },
-    { .offset = 0x0510000, .node_type = CMN_NODE_TYPE_CCHA, .node_id = 12, .ldid = 1, .external = false },
-    { .offset = 0x0550000, .node_type = CMN_NODE_TYPE_RN_I, .node_id = 13, .ldid = 2, .external = false },
-};
-
-static const struct CmnChildSeed cmn_xp02_children[] = {
-    { .offset = 0x0980000, .node_type = CMN_NODE_TYPE_SBSX, .node_id = 18, .ldid = 1, .external = false },
-    { .offset = 0x09c0000, .node_type = CMN_NODE_TYPE_SBSX, .node_id = 19, .ldid = 2, .external = false },
-    { .offset = 0x0b10000, .node_type = CMN_NODE_TYPE_HN_I, .node_id = 20, .ldid = 1, .external = false },
-    { .offset = 0x0b50000, .node_type = CMN_NODE_TYPE_HN_I, .node_id = 21, .ldid = 2, .external = false },
-    { .offset = 0x0a90000, .node_type = CMN_NODE_TYPE_RN_SAM, .node_id = 22, .ldid = 4, .external = false },
-    { .offset = 0x0990000, .node_type = CMN_NODE_TYPE_RN_I, .node_id = 22, .ldid = 3, .external = false },
-};
-
-static const struct CmnChildSeed cmn_xp10_children[] = {
-    { .offset = 0x1200000, .node_type = CMN_NODE_TYPE_RN_SAM, .node_id = 32, .ldid = 5, .external = false },
-    { .offset = 0x1100000, .node_type = CMN_NODE_TYPE_RN_I, .node_id = 32, .ldid = 4, .external = false },
-    { .offset = 0x1380000, .node_type = CMN_NODE_TYPE_HN_I, .node_id = 34, .ldid = 3, .external = false },
-    { .offset = 0x1310000, .node_type = CMN_NODE_TYPE_CCRA, .node_id = 36, .ldid = 2, .external = false },
-    { .offset = 0x1210000, .node_type = CMN_NODE_TYPE_CCLA, .node_id = 36, .ldid = 2, .external = false },
-    { .offset = 0x1010000, .node_type = CMN_NODE_TYPE_RN_SAM, .node_id = 36, .ldid = 6, .external = false },
-    { .offset = 0x1110000, .node_type = CMN_NODE_TYPE_CCHA, .node_id = 36, .ldid = 2, .external = false },
-    { .offset = 0x1150000, .node_type = CMN_NODE_TYPE_RN_I, .node_id = 37, .ldid = 5, .external = false },
-};
-
-static const struct CmnChildSeed cmn_xp11_children[] = {
-    { .offset = 0x14a0000, .node_type = CMN_NODE_TYPE_RN_SAM, .node_id = 40, .ldid = 7, .external = true },
-    { .offset = 0x1710000, .node_type = CMN_NODE_TYPE_HN_S, .node_id = 44, .ldid = 2, .external = false },
-    { .offset = 0x1510000, .node_type = CMN_NODE_TYPE_HN_S_MPAM_S, .node_id = 44, .ldid = 2, .external = false },
-    { .offset = 0x1610000, .node_type = CMN_NODE_TYPE_HN_S_MPAM_NS, .node_id = 44, .ldid = 2, .external = false },
-    { .offset = 0x1750000, .node_type = CMN_NODE_TYPE_HN_S, .node_id = 45, .ldid = 3, .external = false },
-    { .offset = 0x1550000, .node_type = CMN_NODE_TYPE_HN_S_MPAM_S, .node_id = 45, .ldid = 3, .external = false },
-    { .offset = 0x1650000, .node_type = CMN_NODE_TYPE_HN_S_MPAM_NS, .node_id = 45, .ldid = 3, .external = false },
-};
-
-static const struct CmnChildSeed cmn_xp12_children[] = {
-    { .offset = 0x1980000, .node_type = CMN_NODE_TYPE_SBSX, .node_id = 50, .ldid = 3, .external = false },
-    { .offset = 0x19c0000, .node_type = CMN_NODE_TYPE_SBSX, .node_id = 51, .ldid = 4, .external = false },
-    { .offset = 0x1a10000, .node_type = CMN_NODE_TYPE_RN_SAM, .node_id = 52, .ldid = 8, .external = false },
-    { .offset = 0x1910000, .node_type = CMN_NODE_TYPE_RN_I, .node_id = 52, .ldid = 6, .external = false },
-};
-
-static const struct CmnChildSeed cmn_xp20_children[] = {
-    { .offset = 0x20a0000, .node_type = CMN_NODE_TYPE_RN_SAM, .node_id = 64, .ldid = 9, .external = true },
-    { .offset = 0x2300000, .node_type = CMN_NODE_TYPE_HN_S, .node_id = 66, .ldid = 4, .external = false },
-    { .offset = 0x2100000, .node_type = CMN_NODE_TYPE_HN_S_MPAM_S, .node_id = 66, .ldid = 4, .external = false },
-    { .offset = 0x2200000, .node_type = CMN_NODE_TYPE_HN_S_MPAM_NS, .node_id = 66, .ldid = 4, .external = false },
-    { .offset = 0x23c0000, .node_type = CMN_NODE_TYPE_HN_S, .node_id = 67, .ldid = 5, .external = false },
-    { .offset = 0x21c0000, .node_type = CMN_NODE_TYPE_HN_S_MPAM_S, .node_id = 67, .ldid = 5, .external = false },
-    { .offset = 0x22c0000, .node_type = CMN_NODE_TYPE_HN_S_MPAM_NS, .node_id = 67, .ldid = 5, .external = false },
-    { .offset = 0x2310000, .node_type = CMN_NODE_TYPE_HN_I, .node_id = 68, .ldid = 4, .external = false },
-    { .offset = 0x2390000, .node_type = CMN_NODE_TYPE_CCRA, .node_id = 70, .ldid = 3, .external = false },
-    { .offset = 0x2290000, .node_type = CMN_NODE_TYPE_CCLA, .node_id = 70, .ldid = 3, .external = false },
-    { .offset = 0x2090000, .node_type = CMN_NODE_TYPE_RN_SAM, .node_id = 70, .ldid = 10, .external = false },
-    { .offset = 0x2190000, .node_type = CMN_NODE_TYPE_CCHA, .node_id = 70, .ldid = 3, .external = false },
-    { .offset = 0x21d0000, .node_type = CMN_NODE_TYPE_RN_I, .node_id = 71, .ldid = 7, .external = false },
-};
-
-static const struct CmnChildSeed cmn_xp21_children[] = {
-    { .offset = 0x24a0000, .node_type = CMN_NODE_TYPE_RN_SAM, .node_id = 72, .ldid = 11, .external = true },
-    { .offset = 0x2780000, .node_type = CMN_NODE_TYPE_HN_S, .node_id = 74, .ldid = 6, .external = false },
-    { .offset = 0x2580000, .node_type = CMN_NODE_TYPE_HN_S_MPAM_S, .node_id = 74, .ldid = 6, .external = false },
-    { .offset = 0x2680000, .node_type = CMN_NODE_TYPE_HN_S_MPAM_NS, .node_id = 74, .ldid = 6, .external = false },
-    { .offset = 0x27c0000, .node_type = CMN_NODE_TYPE_HN_S, .node_id = 75, .ldid = 7, .external = false },
-    { .offset = 0x25c0000, .node_type = CMN_NODE_TYPE_HN_S_MPAM_S, .node_id = 75, .ldid = 7, .external = false },
-    { .offset = 0x26c0000, .node_type = CMN_NODE_TYPE_HN_S_MPAM_NS, .node_id = 75, .ldid = 7, .external = false },
-    { .offset = 0x2610000, .node_type = CMN_NODE_TYPE_RN_SAM, .node_id = 76, .ldid = 12, .external = false },
-    { .offset = 0x2510000, .node_type = CMN_NODE_TYPE_RN_I, .node_id = 76, .ldid = 8, .external = false },
-};
-
-static const struct CmnChildSeed cmn_xp22_children[] = {
-    { .offset = 0x2980000, .node_type = CMN_NODE_TYPE_SBSX, .node_id = 82, .ldid = 5, .external = false },
-    { .offset = 0x29c0000, .node_type = CMN_NODE_TYPE_SBSX, .node_id = 83, .ldid = 6, .external = false },
-    { .offset = 0x2a10000, .node_type = CMN_NODE_TYPE_RN_SAM, .node_id = 84, .ldid = 13, .external = false },
-    { .offset = 0x2910000, .node_type = CMN_NODE_TYPE_RN_D, .node_id = 84, .ldid = 0, .external = false },
-    { .offset = 0x2b90000, .node_type = CMN_NODE_TYPE_HN_I, .node_id = 86, .ldid = 5, .external = false },
-};
-
-static const struct CmnXpSeed cmn_mesh[] = {
-    {
-        .offset = 0x0020000,
-        .node_id = 7,
-        .ldid = 0,
-        .port_count = 4,
-        .ports = {
-            { .device_type = CMN_DEVTYPE_SBSX, .cal_connected = false },
-            { .device_type = CMN_DEVTYPE_HN_D, .cal_connected = false },
-            { .device_type = CMN_DEVTYPE_RN_I, .cal_connected = false },
-            { .device_type = CMN_DEVTYPE_CCG, .cal_connected = false },
-        },
-        .children = cmn_xp00_children,
-        .child_count = ARRAY_SIZE(cmn_xp00_children),
-    },
-    {
-        .offset = 0x0420000,
-        .node_id = 15,
-        .ldid = 1,
-        .port_count = 3,
-        .ports = {
-            { .device_type = CMN_DEVTYPE_RNF_ESAM, .cal_connected = true },
-            { .device_type = CMN_DEVTYPE_HN_S, .cal_connected = false },
-            { .device_type = CMN_DEVTYPE_CCG, .cal_connected = false },
-        },
-        .children = cmn_xp01_children,
-        .child_count = ARRAY_SIZE(cmn_xp01_children),
-    },
-    {
-        .offset = 0x0820000,
-        .node_id = 23,
-        .ldid = 2,
-        .port_count = 4,
-        .ports = {
-            { .device_type = CMN_DEVTYPE_SNF, .cal_connected = false },
-            { .device_type = CMN_DEVTYPE_SBSX, .cal_connected = false },
-            { .device_type = CMN_DEVTYPE_HN_I, .cal_connected = false },
-            { .device_type = CMN_DEVTYPE_RN_I, .cal_connected = false },
-        },
-        .children = cmn_xp02_children,
-        .child_count = ARRAY_SIZE(cmn_xp02_children),
-    },
-    {
-        .offset = 0x1020000,
-        .node_id = 39,
-        .ldid = 3,
-        .port_count = 3,
-        .ports = {
-            { .device_type = CMN_DEVTYPE_RN_I, .cal_connected = false },
-            { .device_type = CMN_DEVTYPE_HN_P, .cal_connected = false },
-            { .device_type = CMN_DEVTYPE_CCG, .cal_connected = false },
-        },
-        .children = cmn_xp10_children,
-        .child_count = ARRAY_SIZE(cmn_xp10_children),
-    },
-    {
-        .offset = 0x1420000,
-        .node_id = 47,
-        .ldid = 4,
-        .port_count = 2,
-        .ports = {
-            { .device_type = CMN_DEVTYPE_RNF_ESAM, .cal_connected = false },
-            { .device_type = CMN_DEVTYPE_HN_S, .cal_connected = false },
-        },
-        .children = cmn_xp11_children,
-        .child_count = ARRAY_SIZE(cmn_xp11_children),
-    },
-    {
-        .offset = 0x1820000,
-        .node_id = 55,
-        .ldid = 5,
-        .port_count = 3,
-        .ports = {
-            { .device_type = CMN_DEVTYPE_SNF, .cal_connected = false },
-            { .device_type = CMN_DEVTYPE_SBSX, .cal_connected = false },
-            { .device_type = CMN_DEVTYPE_RN_I, .cal_connected = false },
-        },
-        .children = cmn_xp12_children,
-        .child_count = ARRAY_SIZE(cmn_xp12_children),
-    },
-    {
-        .offset = 0x2020000,
-        .node_id = 71,
-        .ldid = 6,
-        .port_count = 4,
-        .ports = {
-            { .device_type = CMN_DEVTYPE_RNF_ESAM, .cal_connected = false },
-            { .device_type = CMN_DEVTYPE_HN_S, .cal_connected = false },
-            { .device_type = CMN_DEVTYPE_HN_P, .cal_connected = false },
-            { .device_type = CMN_DEVTYPE_CCG, .cal_connected = false },
-        },
-        .children = cmn_xp20_children,
-        .child_count = ARRAY_SIZE(cmn_xp20_children),
-    },
-    {
-        .offset = 0x2420000,
-        .node_id = 79,
-        .ldid = 7,
-        .port_count = 3,
-        .ports = {
-            { .device_type = CMN_DEVTYPE_RNF_ESAM, .cal_connected = false },
-            { .device_type = CMN_DEVTYPE_HN_S, .cal_connected = false },
-            { .device_type = CMN_DEVTYPE_RN_I, .cal_connected = false },
-        },
-        .children = cmn_xp21_children,
-        .child_count = ARRAY_SIZE(cmn_xp21_children),
-    },
-    {
-        .offset = 0x2820000,
-        .node_id = 87,
-        .ldid = 8,
-        .port_count = 4,
-        .ports = {
-            { .device_type = CMN_DEVTYPE_SNF, .cal_connected = false },
-            { .device_type = CMN_DEVTYPE_SBSX, .cal_connected = false },
-            { .device_type = CMN_DEVTYPE_RN_D, .cal_connected = false },
-            { .device_type = CMN_DEVTYPE_HN_P, .cal_connected = false },
-        },
-        .children = cmn_xp22_children,
-        .child_count = ARRAY_SIZE(cmn_xp22_children),
-    },
-};
-
-static const struct CmnInternalSeed cmn_internal_windows[] = {
-    {
-        .offset = 0x0380000,
-        .kind = CMN_INTERNAL_DT,
-        .node_id = 2,
-        .ldid = 0,
-        .owner_type = CMN_NODE_TYPE_HN_I,
-    },
-    {
-        .offset = 0x0280000,
-        .kind = CMN_INTERNAL_DN,
-        .node_id = 2,
-        .ldid = 0,
-        .owner_type = CMN_NODE_TYPE_HN_I,
-    },
-    {
-        .offset = 0x0002000,
-        .kind = CMN_INTERNAL_APB,
-        .node_id = 2,
-        .ldid = 0,
-        .owner_type = CMN_NODE_TYPE_HN_I,
-    },
-    {
-        .offset = 0x02d0000,
-        .kind = CMN_INTERNAL_RNI_RNSAM,
-        .node_id = 7,
-        .ldid = 1,
-        .owner_type = CMN_NODE_TYPE_RN_I,
-    },
-    {
-        .offset = 0x0650000,
-        .kind = CMN_INTERNAL_RNI_RNSAM,
-        .node_id = 13,
-        .ldid = 2,
-        .owner_type = CMN_NODE_TYPE_RN_I,
-    },
-    {
-        .offset = 0x1250000,
-        .kind = CMN_INTERNAL_RNI_RNSAM,
-        .node_id = 37,
-        .ldid = 5,
-        .owner_type = CMN_NODE_TYPE_RN_I,
-    },
-    {
-        .offset = 0x22d0000,
-        .kind = CMN_INTERNAL_RNI_RNSAM,
-        .node_id = 71,
-        .ldid = 7,
-        .owner_type = CMN_NODE_TYPE_RN_I,
-    },
-};
-
 static enum ArmCmnCfgRole arm_cmn_cfg_role(const ArmCmnCfgState *s)
 {
     return (s->role != NULL && strcmp(s->role, "scp") == 0) ?
@@ -457,90 +98,149 @@ static enum ArmCmnCfgRole arm_cmn_cfg_role(const ArmCmnCfgState *s)
         ARM_CMN_ROLE_AP;
 }
 
-static uint64_t cmn_make_node_info(uint16_t type, uint16_t id, uint16_t ldid)
+static void cmn3_topology_clear(Cmn3Topology *topology)
 {
-    uint64_t value = 0;
-
-    value |= type & CMN_NODE_INFO_TYPE_MASK;
-    value |= (uint64_t)id << CMN_NODE_INFO_ID_POS;
-    value |= (uint64_t)ldid << CMN_NODE_INFO_LDID_POS;
-
-    return value;
+    g_free(topology->entries);
+    topology->entries = NULL;
 }
 
-static uint64_t cmn_make_xp_node_info(
-    uint16_t id,
-    uint16_t ldid,
-    uint8_t port_count)
+static uint32_t cmn3_payload_crc32(const uint8_t *payload, size_t length)
 {
-    return cmn_make_node_info(CMN_NODE_TYPE_XP, id, ldid) |
-        ((uint64_t)port_count << CMN_MXP_NUM_PORTS_POS);
+    uLong crc = crc32(0L, Z_NULL, 0);
+
+    while (length != 0) {
+        uInt chunk = length > UINT_MAX ? UINT_MAX : length;
+
+        crc = crc32(crc, payload, chunk);
+        payload += chunk;
+        length -= chunk;
+    }
+    return crc;
 }
 
-static uint64_t cmn_make_child_info(uint16_t count)
+static bool cmn3_load_topology(const ArmCmnCfgState *s,
+                               Cmn3Topology *topology, Error **errp)
 {
-    return ((uint64_t)CMN_CFG_CHILD_PTR_BASE << CMN_CHILD_PTR_OFF_POS) |
-        (count & CMN_CHILD_COUNT_MASK);
-}
+    g_autoptr(GError) error = NULL;
+    g_autofree char *data = NULL;
+    const uint8_t *bytes;
+    const uint8_t *payload;
+    const uint8_t *version;
+    const uint8_t *version_end;
+    gsize length;
+    uint32_t entry_count;
+    uint32_t seed_extent;
+    uint32_t expected_crc;
+    uint64_t previous_offset = 0;
 
-static uint64_t cmn_make_child_ptr(const struct CmnChildSeed *child)
-{
-    uint64_t value = child->offset;
-
-    if (child->external) {
-        value |= 1ULL << CMN_CHILD_PTR_EXTERNAL_POS;
+    if (s->topology_file == NULL || s->topology_file[0] == '\0') {
+        error_setg(errp, "%s: topology-file must be set", TYPE_ARM_CMN_CFG);
+        return false;
+    }
+    if (!g_file_get_contents(s->topology_file, &data, &length, &error)) {
+        error_setg(errp, "%s: cannot read topology-file '%s': %s",
+                   TYPE_ARM_CMN_CFG, s->topology_file, error->message);
+        return false;
     }
 
-    return value;
-}
-
-static uint64_t cmn_make_port_info(const struct CmnPortSeed *port)
-{
-    uint64_t value = port->device_type;
-
-    if (port->cal_connected) {
-        value |= CMN_MXP_PORT_CAL_CONNECTED;
+    bytes = (const uint8_t *)data;
+    if (length < CMN3_HEADER_SIZE) {
+        error_setg(errp, "%s: topology artifact is shorter than its header",
+                   TYPE_ARM_CMN_CFG);
+        return false;
+    }
+    if (memcmp(bytes, "CMN3", 4) != 0) {
+        error_setg(errp, "%s: topology artifact has invalid magic",
+                   TYPE_ARM_CMN_CFG);
+        return false;
+    }
+    if (lduw_le_p(bytes + 4) != CMN3_FORMAT_VERSION) {
+        error_setg(errp, "%s: unsupported format version %u",
+                   TYPE_ARM_CMN_CFG, lduw_le_p(bytes + 4));
+        return false;
+    }
+    if (lduw_le_p(bytes + 6) != CMN3_HEADER_SIZE) {
+        error_setg(errp, "%s: invalid CMN3 header size %u",
+                   TYPE_ARM_CMN_CFG, lduw_le_p(bytes + 6));
+        return false;
+    }
+    if (lduw_le_p(bytes + 8) == 0 || lduw_le_p(bytes + 10) == 0) {
+        error_setg(errp, "%s: mesh dimensions must be nonzero",
+                   TYPE_ARM_CMN_CFG);
+        return false;
+    }
+    if (lduw_le_p(bytes + 14) != 0) {
+        error_setg(errp, "%s: reserved field must be zero",
+                   TYPE_ARM_CMN_CFG);
+        return false;
     }
 
-    return value;
-}
-
-static uint16_t cmn_internal_kind_node_type(enum CmnInternalKind kind)
-{
-    switch (kind) {
-    case CMN_INTERNAL_CFG:
-        return CMN_NODE_TYPE_CFG_ROOT;
-    case CMN_INTERNAL_DT:
-        return 0x0003;
-    case CMN_INTERNAL_DN:
-        return 0x0001;
-    case CMN_INTERNAL_APB:
-        return CMN_NODE_TYPE_CFG_ROOT;
-    case CMN_INTERNAL_RNI_RNSAM:
-        return CMN_NODE_TYPE_RN_SAM;
-    default:
-        g_assert_not_reached();
+    seed_extent = ldl_le_p(bytes + 16);
+    entry_count = ldl_le_p(bytes + 20);
+    if (seed_extent == 0 || seed_extent > s->cfg_size) {
+        error_setg(errp, "%s: seed extent exceeds cfg-size",
+                   TYPE_ARM_CMN_CFG);
+        return false;
     }
-}
+    if ((length - CMN3_HEADER_SIZE) % CMN3_ENTRY_SIZE != 0 ||
+        (length - CMN3_HEADER_SIZE) / CMN3_ENTRY_SIZE != entry_count) {
+        error_setg(errp,
+                   "%s: topology artifact length does not match entry count",
+                   TYPE_ARM_CMN_CFG);
+        return false;
+    }
 
-static uint64_t cmn_make_internal_tag0(const struct CmnInternalSeed *seed)
-{
-    return 0x434d4e0000000000ULL |
-        ((uint64_t)seed->kind << 32) |
-        ((uint64_t)seed->owner_type << 16) |
-        seed->node_id;
-}
+    version = bytes + 32;
+    version_end = memchr(version, '\0', 32);
+    if (version_end == NULL ||
+        !g_utf8_validate((const char *)version, version_end - version, NULL)) {
+        error_setg(errp, "%s: version text is not valid NUL-terminated UTF-8",
+                   TYPE_ARM_CMN_CFG);
+        return false;
+    }
 
-static uint64_t cmn_make_internal_tag1(const struct CmnInternalSeed *seed)
-{
-    return ((uint64_t)seed->ldid << 48) |
-        ((uint64_t)seed->child_count << 32) |
-        seed->offset;
-}
+    payload = bytes + CMN3_HEADER_SIZE;
+    expected_crc = ldl_le_p(bytes + 28);
+    if (cmn3_payload_crc32(payload, length - CMN3_HEADER_SIZE) !=
+        expected_crc) {
+        error_setg(errp, "%s: payload CRC32 mismatch", TYPE_ARM_CMN_CFG);
+        return false;
+    }
 
-static void cmn_writeq(uint8_t *cfg, uint32_t offset, uint64_t value)
-{
-    stq_le_p(cfg + offset, value);
+    topology->entries = g_new(Cmn3Entry, entry_count);
+    topology->seed_extent = seed_extent;
+    topology->entry_count = entry_count;
+    for (uint32_t i = 0; i < entry_count; i++) {
+        const uint8_t *encoded = payload + i * CMN3_ENTRY_SIZE;
+        uint64_t offset = ldq_le_p(encoded);
+
+        if (i != 0 && offset <= previous_offset) {
+            error_setg(errp,
+                       "%s: entry offsets must be strictly increasing",
+                       TYPE_ARM_CMN_CFG);
+            cmn3_topology_clear(topology);
+            return false;
+        }
+        if (offset % sizeof(uint64_t) != 0) {
+            error_setg(errp, "%s: entry offset must be 8-byte aligned",
+                       TYPE_ARM_CMN_CFG);
+            cmn3_topology_clear(topology);
+            return false;
+        }
+        if (offset > seed_extent ||
+            seed_extent - offset < sizeof(uint64_t)) {
+            error_setg(errp, "%s: entry exceeds seed extent",
+                       TYPE_ARM_CMN_CFG);
+            cmn3_topology_clear(topology);
+            return false;
+        }
+
+        topology->entries[i].offset = offset;
+        topology->entries[i].value = ldq_le_p(encoded + 8);
+        previous_offset = offset;
+    }
+
+    return true;
 }
 
 static uint64_t arm_cmn_cfg_load(const uint8_t *base, hwaddr addr,
@@ -581,138 +281,13 @@ static void arm_cmn_cfg_store(uint8_t *base, hwaddr addr, uint64_t value,
     }
 }
 
-static void cmn_seed_root_registers(uint8_t *cfg)
+static void cmn3_seed_window(uint8_t *cfg, const Cmn3Topology *topology)
 {
-    uint64_t info_global = 0;
-    size_t i;
-
-    cmn_writeq(cfg, CMN_CFG_NODE_INFO,
-               cmn_make_node_info(CMN_NODE_TYPE_CFG_ROOT, 0, 0));
-
-    /* PID/CID values taken from the CMN S3(AE) reset-state tables. */
-    cmn_writeq(cfg, CMN_CFG_PERIPH_ID_01, 0x000000000000b43eULL);
-    cmn_writeq(cfg, CMN_CFG_PERIPH_ID_23, 0x000000000000003bULL);
-    cmn_writeq(cfg, CMN_CFG_PERIPH_ID_45, 0x00000000000000c4ULL);
-    cmn_writeq(cfg, CMN_CFG_PERIPH_ID_67, 0x0000000000000000ULL);
-    cmn_writeq(cfg, CMN_CFG_COMPONENT_ID_01, 0x000000000000f00dULL);
-    cmn_writeq(cfg, CMN_CFG_COMPONENT_ID_23, 0x000000000000b105ULL);
-
-    cmn_writeq(cfg, CMN_CFG_CHILD_INFO, cmn_make_child_info(ARRAY_SIZE(cmn_mesh)));
-
-    for (i = 0; i < ARRAY_SIZE(cmn_mesh); ++i) {
-        cmn_writeq(cfg,
-                   CMN_CFG_CHILD_PTR_BASE + (i * sizeof(uint64_t)),
-                   cmn_mesh[i].offset);
+    memset(cfg, 0, topology->seed_extent);
+    for (uint32_t i = 0; i < topology->entry_count; i++) {
+        stq_le_p(cfg + topology->entries[i].offset,
+                 topology->entries[i].value);
     }
-
-    /*
-     * Conservative discovery values:
-     *   CHI version = CHI-D
-     *   physical/REQ address width = 48 bits
-     */
-    info_global |= 4ULL << 56;
-    info_global |= 48ULL << 16;
-    info_global |= 48ULL << 8;
-    cmn_writeq(cfg, CMN_CFG_INFO_GLOBAL, info_global);
-    cmn_writeq(cfg, CMN_CFG_INFO_GLOBAL_1, 0);
-    cmn_writeq(cfg, CMN_CFG_SECURE_ACCESS, 0);
-    cmn_writeq(cfg, CMN_CFG_RCR, 0);
-    cmn_writeq(cfg, CMN_CFG_SCR, 0);
-    cmn_writeq(cfg, CMN_CFG_RAS_MODE, 0);
-}
-
-static void cmn_seed_mesh(uint8_t *cfg, uint64_t seed_size)
-{
-    size_t i, j;
-
-    for (i = 0; i < ARRAY_SIZE(cmn_mesh); ++i) {
-        const struct CmnXpSeed *xp = &cmn_mesh[i];
-        uint32_t xp_offset = xp->offset;
-
-        g_assert((uint64_t)xp_offset + 0x10000 <= seed_size);
-
-        cmn_writeq(cfg,
-                   xp_offset + CMN_CFG_NODE_INFO,
-                   cmn_make_xp_node_info(xp->node_id, xp->ldid,
-                                         xp->port_count));
-        cmn_writeq(cfg,
-                   xp_offset + CMN_CFG_CHILD_INFO,
-                   cmn_make_child_info(xp->child_count));
-
-        for (j = 0; j < xp->port_count; ++j) {
-            cmn_writeq(cfg,
-                       xp_offset + CMN_MXP_PORT_INFO_BASE +
-                           (j * CMN_MXP_PORT_INFO_STEP),
-                       cmn_make_port_info(&xp->ports[j]));
-        }
-
-        for (j = 0; j < xp->child_count; ++j) {
-            const struct CmnChildSeed *node = &xp->children[j];
-            uint32_t node_offset = node->offset;
-
-            g_assert((uint64_t)node_offset + 0x10000 <= seed_size);
-
-            cmn_writeq(cfg,
-                       xp_offset + CMN_MXP_CHILD_PTR_BASE +
-                           (j * sizeof(uint64_t)),
-                       cmn_make_child_ptr(node));
-
-            cmn_writeq(cfg,
-                       node_offset + CMN_CFG_NODE_INFO,
-                       cmn_make_node_info(node->node_type,
-                                          node->node_id,
-                                          node->ldid));
-            cmn_writeq(cfg, node_offset + CMN_NODE_CHILD_INFO, 0);
-        }
-    }
-}
-
-static void cmn_seed_internal_windows(uint8_t *cfg, uint64_t seed_size)
-{
-    size_t i;
-
-    for (i = 0; i < ARRAY_SIZE(cmn_internal_windows); ++i) {
-        const struct CmnInternalSeed *seed = &cmn_internal_windows[i];
-        uint32_t offset = seed->offset;
-        size_t j;
-
-        g_assert((uint64_t)offset + 0x1000 <= seed_size);
-
-        cmn_writeq(cfg,
-                   offset + CMN_CFG_NODE_INFO,
-                   cmn_make_node_info(cmn_internal_kind_node_type(seed->kind),
-                                      seed->node_id,
-                                      seed->ldid));
-        cmn_writeq(cfg,
-                   offset + CMN_CFG_UNIT_INFO_0,
-                   cmn_make_internal_tag0(seed));
-        cmn_writeq(cfg,
-                   offset + CMN_CFG_UNIT_INFO_1,
-                   cmn_make_internal_tag1(seed));
-
-        if (seed->child_count == 0) {
-            cmn_writeq(cfg, offset + CMN_CFG_CHILD_INFO, 0);
-            continue;
-        }
-
-        cmn_writeq(cfg,
-                   offset + CMN_CFG_CHILD_INFO,
-                   cmn_make_child_info(seed->child_count));
-        for (j = 0; j < seed->child_count; ++j) {
-            cmn_writeq(cfg,
-                       offset + CMN_CFG_CHILD_PTR_BASE +
-                           (j * sizeof(uint64_t)),
-                       seed->children[j]);
-        }
-    }
-}
-
-static void arm_cmn_cfg_seed_window(uint8_t *cfg, uint64_t seed_size)
-{
-    memset(cfg, 0, seed_size);
-    cmn_seed_root_registers(cfg);
-    cmn_seed_mesh(cfg, seed_size);
-    cmn_seed_internal_windows(cfg, seed_size);
 }
 
 static void arm_cmn_trace_reset(uint8_t *trace)
@@ -741,16 +316,17 @@ static void arm_cmn_trace_log(ArmCmnCfgState *s, uint64_t addr, uint64_t value,
         return;
     }
 
-    seq = hdr->producer;
+    seq = qatomic_fetch_inc(&hdr->producer);
     idx = seq % hdr->capacity;
-    entry = (struct ArmCmnTraceEntry *)(s->trace_ptr + ARM_CMN_TRACE_ENTRY_BASE +
-        (idx * ARM_CMN_TRACE_ENTRY_STRIDE));
+    entry = (struct ArmCmnTraceEntry *)(s->trace_ptr +
+        ARM_CMN_TRACE_ENTRY_BASE + idx * ARM_CMN_TRACE_ENTRY_STRIDE);
 
-    entry->seq = seq;
-    entry->info = ((uint64_t)size << 8) | op;
+    entry->info = ((uint64_t)op << 32) | size;
     entry->addr = addr;
     entry->value = value;
-    hdr->producer = seq + 1;
+    /* Publish the entry payload before making its sequence visible. */
+    smp_wmb();
+    entry->seq = seq + 1;
 }
 
 static uint64_t arm_cmn_cfg_read(void *opaque, hwaddr addr, unsigned size)
@@ -850,29 +426,31 @@ static bool arm_cmn_cfg_map_file(const char *path, uint64_t size, bool truncate,
     return true;
 }
 
-static bool arm_cmn_cfg_init_window(ArmCmnCfgState *s, Error **errp)
+static bool arm_cmn_cfg_init_window(ArmCmnCfgState *s,
+                                    const Cmn3Topology *topology,
+                                    Error **errp)
 {
-    bool seed_cfg = (arm_cmn_cfg_role(s) == ARM_CMN_ROLE_SCP);
+    bool scp_role = arm_cmn_cfg_role(s) == ARM_CMN_ROLE_SCP;
 
     if (!arm_cmn_cfg_map_file(s->shm_path, s->cfg_size, false, &s->cfg_ptr,
                               errp)) {
         return false;
     }
 
-    if (seed_cfg || ldq_le_p(s->cfg_ptr + CMN_CFG_NODE_INFO) !=
-            cmn_make_node_info(CMN_NODE_TYPE_CFG_ROOT, 0, 0)) {
-        arm_cmn_cfg_seed_window(s->cfg_ptr, ARM_CMN_CFG_SEED_SIZE);
+    if (scp_role || ldq_le_p(s->cfg_ptr) == 0) {
+        cmn3_seed_window(s->cfg_ptr, topology);
     }
 
     if (!arm_cmn_cfg_map_file(s->trace_shm_path, ARM_CMN_TRACE_SIZE,
-                              seed_cfg, &s->trace_ptr, errp)) {
+                              scp_role, &s->trace_ptr, errp)) {
         munmap(s->cfg_ptr, s->cfg_size);
         s->cfg_ptr = NULL;
         return false;
     }
 
-    if (seed_cfg ||
-        ldq_le_p(s->trace_ptr + ARM_CMN_TRACE_REG_MAGIC) != ARM_CMN_TRACE_MAGIC) {
+    if (scp_role ||
+        ldq_le_p(s->trace_ptr + ARM_CMN_TRACE_REG_MAGIC) !=
+        ARM_CMN_TRACE_MAGIC) {
         arm_cmn_trace_reset(s->trace_ptr);
     }
 
@@ -882,16 +460,23 @@ static bool arm_cmn_cfg_init_window(ArmCmnCfgState *s, Error **errp)
 static void arm_cmn_cfg_realize(DeviceState *dev, Error **errp)
 {
     ArmCmnCfgState *s = ARM_CMN_CFG(dev);
+    Cmn3Topology topology = { 0 };
 
     if (s->shm_path == NULL || s->trace_shm_path == NULL || s->cfg_size == 0) {
-        error_setg(errp, "%s: shm-path, trace-shm-path and cfg-size must be set",
+        error_setg(errp,
+                   "%s: shm-path, trace-shm-path and cfg-size must be set",
                    TYPE_ARM_CMN_CFG);
         return;
     }
 
-    if (!arm_cmn_cfg_init_window(s, errp)) {
+    if (!cmn3_load_topology(s, &topology, errp)) {
         return;
     }
+    if (!arm_cmn_cfg_init_window(s, &topology, errp)) {
+        cmn3_topology_clear(&topology);
+        return;
+    }
+    cmn3_topology_clear(&topology);
 
     memory_region_init_io(&s->cfg, OBJECT(s), &arm_cmn_cfg_ops, s,
                           TYPE_ARM_CMN_CFG ".cfg", s->cfg_size);
@@ -931,6 +516,7 @@ static const VMStateDescription vmstate_arm_cmn_cfg = {
 static const Property arm_cmn_cfg_properties[] = {
     DEFINE_PROP_STRING("shm-path", ArmCmnCfgState, shm_path),
     DEFINE_PROP_STRING("trace-shm-path", ArmCmnCfgState, trace_shm_path),
+    DEFINE_PROP_STRING("topology-file", ArmCmnCfgState, topology_file),
     DEFINE_PROP_STRING("role", ArmCmnCfgState, role),
     DEFINE_PROP_UINT64("cfg-size", ArmCmnCfgState, cfg_size,
                        ARM_CMN_CFG_DEFAULT_SIZE),

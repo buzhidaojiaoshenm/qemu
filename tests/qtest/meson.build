@@ -248,7 +248,8 @@ qtests_arm = \
   (config_all_devices.has_key('CONFIG_FSI_APB2OPB_ASPEED') ? ['aspeed_fsi-test'] : []) + \
   (config_all_devices.has_key('CONFIG_STM32L4X5_SOC') and
    config_all_devices.has_key('CONFIG_DM163')? ['dm163-test'] : []) + \
-  ['arm-cpu-features',
+  ['arm-cmn-cfg-test',
+   'arm-cpu-features',
    'boot-serial-test']
 
 # TODO: once aarch64 TCG is fixed on ARM 32 bit host, make bios-tables-test unconditional
@@ -378,6 +379,7 @@ if get_option('replication').allowed()
 endif
 
 qtests = {
+  'arm-cmn-cfg-test': [zlib],
   'aspeed_hace-test': files('aspeed-hace-utils.c', 'aspeed_hace-test.c'),
   'aspeed_smc-test': files('aspeed-smc-utils.c', 'aspeed_smc-test.c'),
   'ast2700-hace-test': files('aspeed-hace-utils.c', 'ast2700-hace-test.c'),
